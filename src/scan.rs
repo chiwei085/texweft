@@ -151,16 +151,44 @@ pub fn xdv_fonts(xdv: &[u8]) -> BTreeSet<String> {
     out
 }
 
-/// `INPUT` or `OUTPUT` paths from a `-recorder` `.fls`, resolved against its `PWD`.
-pub fn fls_paths(fls: &str, kind: &str) -> BTreeSet<PathBuf> {
-    let pwd = fls
-        .lines()
-        .find_map(|l| l.strip_prefix("PWD "))
-        .unwrap_or("");
-    fls.lines()
-        .filter_map(|l| l.strip_prefix(kind)?.strip_prefix(' '))
-        .map(|p| Path::new(pwd).join(p).components().collect())
-        .collect()
+/// What one engine run recorded with `-recorder`: paths resolved against the `.fls` `PWD`.
+#[derive(Default)]
+pub struct Fls {
+    pub inputs: BTreeSet<PathBuf>,
+    pub outputs: BTreeSet<PathBuf>,
+}
+
+impl Fls {
+    pub fn parse(fls: &str) -> Fls {
+        let pwd = Path::new(fls.lines().find_map(|l| l.strip_prefix("PWD ")).unwrap_or(""));
+        let mut f = Fls::default();
+        for l in fls.lines() {
+            let (set, p) = if let Some(p) = l.strip_prefix("INPUT ") {
+                (&mut f.inputs, p)
+            } else if let Some(p) = l.strip_prefix("OUTPUT ") {
+                (&mut f.outputs, p)
+            } else {
+                continue;
+            };
+            set.insert(pwd.join(p).components().collect());
+        }
+        f
+    }
+}
+
+/// TeX gave up: after `Emergency stop` or a fatal error its files are truncated.
+pub fn aborted(log: &str) -> bool {
+    log.contains("Emergency stop") || log.contains("Fatal error occurred")
+}
+
+/// The file TeX could not open for writing (``I can't write on file `ch/one.aux'``).
+pub fn unwritable(log: &str) -> Option<&str> {
+    log.lines().find_map(|l| quoted(l, "I can't write on file `", "'"))
+}
+
+/// A shell command the run executed (`runsystem(...)...executed`); disabled ones ran nothing.
+pub fn shell_escape(log: &str) -> Option<&str> {
+    log.lines().find(|l| l.contains("runsystem(") && !l.ends_with("disabled."))
 }
 
 #[derive(Debug)]
@@ -395,12 +423,19 @@ mod tests {
 
     #[test]
     fn inputs_from_fls() {
-        let got = fls_paths(include_str!("../tests/fixtures/demo.fls"), "INPUT");
+        let got = Fls::parse(include_str!("../tests/fixtures/demo.fls")).inputs;
         assert!(got.contains(Path::new("/home/user/demo/main.tex")));
         assert!(got.iter().all(|p| p.is_absolute()));
-        assert!(
-            fls_paths("PWD /w\nOUTPUT ./main.aux\n", "OUTPUT").contains(Path::new("/w/main.aux"))
-        );
+        let f = Fls::parse("PWD /w\nINPUT main.tex\nOUTPUT ./main.aux\n");
+        assert!(f.outputs.contains(Path::new("/w/main.aux")) && !f.outputs.contains(Path::new("/w/main.tex")));
+    }
+
+    #[test]
+    fn engine_states_from_log() {
+        assert!(aborted("./a.tex:1: Emergency stop.") && !aborted("Output written on a.pdf"));
+        assert_eq!(unwritable("./main.tex:4: I can't write on file `ch/one.aux'."), Some("ch/one.aux"));
+        assert_eq!(shell_escape("runsystem(repstopdf x.eps)...disabled."), None);
+        assert!(shell_escape("runsystem(makeindex main.idx)...executed safely (allowed).").is_some());
     }
 
     #[test]

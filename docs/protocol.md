@@ -185,7 +185,10 @@ invalidates all fingerprints; see `toolchain-changed`.
 
 Within a build, an engine run reruns when it changed a file under the output
 directory that the next run reads: a file it both read and wrote (`.aux`, `.toc`),
-or one it newly created. Logs, PDFs, and caches outside the output directory
+or one it newly created. Without an `.aux`, the first run starts from the one a
+one-page document without cross-references writes (`\relax`, `\@abspage@last`),
+as latexmk does: a run that writes the same read its own result, so a simple
+document needs one run. Logs, PDFs, and caches outside the output directory
 do not count. A bibliography step runs when its control data (`\citation`,
 `\bibdata`, `\bibstyle` lines of the `.aux` tree, or the `.bcf`) or a database it
 read changed, and its new `.bbl` triggers an engine rerun.
@@ -220,11 +223,28 @@ in the output directory would be found first, so it is removed and the engine
 reruns; BibTeX's recorded state is dropped, so `clean` keeps the shipped file.
 
 Across builds, the driver keeps `<job>.texweft.json` in the output directory,
-written only after `converged`. An input whose mtime is later than the last
-verification is recorded without a hash, so a file saved after it triggers the
-next build instead of being taken as up to date. When the toolchain, every recorded input, and the
-PDF are unchanged, nothing runs: `steps` is 0, artifacts are reported with
-`fresh: false`, and `preview` is the PDF.
+carrying a format version (`"v"`): a state from a texweft whose format differs
+counts as no previous run, so an up-to-date build never reports less than the
+current format records. It is written after `converged`, and after `failed` when
+the document caused the failure: the same inputs fail the same way, so such a
+build is reused as latexmk does. A failure with tool trouble (a crash, a timeout,
+a bibliography tool or `xdvipdfmx` erring) or at the run limit leaves no state,
+nor do `missing`, `unsupported`, and `not-converged`: another try may get further,
+and an installation can fix a build without changing any input it read. An input
+whose mtime is later than the last verification is recorded without a hash, so a
+file saved after it triggers the next build instead of being taken as up to date.
+When the toolchain, every recorded input, and the PDF are unchanged, nothing
+runs: `steps` is 0, the reused build's `diagnostic` and `missing` messages are
+replayed with `step: null`, artifacts are reported with `fresh: false`, and
+`outcome` and `preview` are those of the reused build.
+
+Content hashes decide; the state also keeps each file's stat (size, mtime,
+ctime, inode), and a file whose stat is unchanged keeps its recorded hash
+without being read, as latexmk and git do. A stat is only trusted once it is
+3 s older than the hash taken with it, so a write within the same timestamp
+tick is never missed; any write changes the ctime, which `touch -d`, `cp -p`,
+and unpacking archives cannot set back. An up-to-date build records stats that
+have become trustworthy since, so the next one reads nothing.
 
 ### diagnostic
 

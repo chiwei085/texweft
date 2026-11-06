@@ -4,7 +4,7 @@
 //! A change only counts when a content hash differs from what the build used, so `touch`,
 //! rewrites with identical bytes, and the build's own outputs never trigger a rebuild.
 
-use crate::{Build, Opts, Report, emit, find_bin, hash, shutdown};
+use crate::{Build, Opts, Report, emit, find_bin, first_line, hash, shutdown};
 use notify::event::{AccessKind, AccessMode};
 use notify::{Config, ErrorKind, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::json;
@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs};
 
 /// Quiet time after the last relevant event before building: editors save in several writes.
@@ -29,7 +29,7 @@ const UNSEEN_RETRIES: u32 = 2;
 
 type Events = notify::Result<Event>;
 
-#[derive(PartialEq, PartialOrd)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Change {
     None,
     Resync,
@@ -44,23 +44,18 @@ struct Targets {
 }
 
 impl Targets {
-    fn new(r: Report, ls_r: Vec<PathBuf>) -> Targets {
+    /// `ls_r` with current hashes: tlmgr rewrites ls-R on every install, so a build that ended
+    /// `missing` reruns once the caller installs the package, without restarting the watch.
+    fn new(r: Report, ls_r: &BTreeMap<PathBuf, Option<String>>) -> Targets {
         let mut inputs: BTreeMap<_, _> = r.inputs.into_iter().collect();
-        // tlmgr rewrites ls-R on every install, so a build that ended `missing` reruns once the
-        // caller installs the package, without the caller having to restart the watch.
-        for p in ls_r {
-            let h = hash(&p);
-            inputs.entry(p).or_insert(h);
+        for (p, h) in ls_r {
+            inputs.entry(p.clone()).or_insert_with(|| h.clone());
         }
         Targets { inputs, awaited: r.awaited }
     }
 
     fn changed(p: &Path, was: &Option<String>) -> bool {
-        let now = hash(p);
-        match was {
-            Some(_) => now != *was,
-            None => now.is_some(),
-        }
+        hash(p) != *was
     }
 
     /// Where each input lives, and the nearest existing ancestor of each awaited path.
@@ -161,30 +156,39 @@ impl Backend {
 /// Every ls-R kpathsea consults, from `$TEXMFDBS`.
 fn ls_r(engine: &str) -> Vec<PathBuf> {
     let Some(bin) = find_bin(engine) else { return Vec::new() };
-    let Ok(out) = Command::new(bin.join("kpsewhich")).arg("-expand-path=$TEXMFDBS").output() else { return Vec::new() };
-    let dbs = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let Some(dbs) = first_line(Command::new(bin.join("kpsewhich")).arg("-expand-path=$TEXMFDBS")) else { return Vec::new() };
     env::split_paths(&dbs)
         .map(|d| PathBuf::from(d.to_string_lossy().trim_start_matches("!!")).join("ls-R"))
         .filter(|p| p.is_file())
         .collect()
 }
 
+fn mtime(p: &Path) -> Option<SystemTime> {
+    fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
 /// Blocks until a rebuild is due, or until the watched set needs updating.
 fn wait(rx: &Receiver<Events>, t: &Targets, watched: &mut BTreeSet<PathBuf>) -> Change {
     let (mut first, mut deadline): (Option<Instant>, Option<Instant>) = (None, None);
+    // What the settle window saw: paths that looked changed, and whether the stream lost track.
+    let (mut pending, mut lost) = (BTreeSet::new(), false);
     loop {
         let ev = match deadline {
             None => rx.recv_timeout(IDLE_TICK),
             Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
         };
+        // `None`: the stream lost track (watcher error, queue overflow).
+        let ev = ev.map(|e| e.ok().filter(|e| !e.need_rescan()));
         let change = match ev {
             // Settled: decide by content now, not by what an event saw. A save truncates then writes,
-            // so the event may have seen an empty file, and A→B→A ends where it began.
+            // so the event may have seen an empty file, and A→B→A ends where it began. Only the
+            // paths seen changing are compared again, unless the stream lost track.
             Err(RecvTimeoutError::Timeout) if deadline.is_some() => {
-                if t.any_changed() {
+                if pending.iter().any(|p: &PathBuf| t.classify(p) == Change::Rebuild) || (lost && t.any_changed()) {
                     return Change::Rebuild;
                 }
-                (first, deadline) = (None, None);
+                (first, deadline, lost) = (None, None, false);
+                pending.clear();
                 Change::None
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -194,20 +198,27 @@ fn wait(rx: &Receiver<Events>, t: &Targets, watched: &mut BTreeSet<PathBuf>) -> 
                 Change::None
             }
             Err(RecvTimeoutError::Disconnected) => shutdown(1),
-            Ok(Err(_)) => {
+            // The stream lost track: compare everything.
+            Ok(None) => {
+                lost = true;
                 if t.any_changed() { Change::Rebuild } else { Change::None }
             }
             // Reads are not changes; inotify reports every open.
-            Ok(Ok(e)) if matches!(e.kind, EventKind::Access(a) if a != AccessKind::Close(AccessMode::Write)) => Change::None,
-            Ok(Ok(e)) if e.need_rescan() => {
-                if t.any_changed() { Change::Rebuild } else { Change::None }
-            }
-            Ok(Ok(e)) => {
+            Ok(Some(e)) if matches!(e.kind, EventKind::Access(a) if a != AccessKind::Close(AccessMode::Write)) => Change::None,
+            Ok(Some(e)) => {
                 // A watched directory that is removed loses its watch; re-add it once it is back.
                 if matches!(e.kind, EventKind::Remove(_)) && e.paths.iter().any(|p| watched.remove(p)) && deadline.is_none() {
                     return Change::Resync;
                 }
-                e.paths.iter().map(|p| t.classify(p)).fold(Change::None, |a, b| if b > a { b } else { a })
+                let mut change = Change::None;
+                for p in e.paths {
+                    let c = t.classify(&p);
+                    if c == Change::Rebuild {
+                        pending.insert(p);
+                    }
+                    change = change.max(c);
+                }
+                change
             }
         };
         match change {
@@ -240,24 +251,40 @@ pub fn run(main: &Path, o: &Opts, force: bool) -> ! {
     let mut watched = BTreeSet::new();
     let mut force = force;
     let mut unseen_runs: BTreeMap<PathBuf, u32> = BTreeMap::new();
+    // ls-R files and their hashes, rehashed only when their mtime moves (an install rewrites them).
+    let mut lsr: BTreeMap<PathBuf, (Option<SystemTime>, Option<String>)> = BTreeMap::new();
     loop {
         let report = if main.exists() {
             Build::new(main, o, force).run()
         } else {
             eprintln!("texweft: {} does not exist; waiting for it", main.display());
-            Report { ok: false, tex_root: None, inputs: Vec::new(), awaited: vec![main.to_path_buf()] }
+            Report { ok: false, inputs: Vec::new(), verified: SystemTime::now(), awaited: vec![main.to_path_buf()] }
         };
         force = false;
-        let mut t = Targets::new(report, ls_r(&o.engine));
+        if lsr.is_empty() {
+            lsr = ls_r(&o.engine).into_iter().map(|p| (p, (None, None))).collect();
+        }
+        for (p, (m, h)) in lsr.iter_mut() {
+            let now = mtime(p);
+            if now.is_none() || now != *m {
+                (*m, *h) = (now, hash(p));
+            }
+        }
+        let verified = report.verified;
+        let mut t = Targets::new(report, &lsr.iter().map(|(p, (_, h))| (p.clone(), h.clone())).collect());
         let added = backend.sync(&mut watched, &t);
 
         // Events are hints; content decides. Changes no event will report: inputs modified during
-        // the build (no hash), inputs in directories watched only now, awaited files already there.
+        // the build (no hash), inputs modified after the build verified them but before their
+        // directory was watched, awaited files already there.
         let unseen: Vec<PathBuf> = t
             .inputs
             .iter()
             .filter(|(p, h)| {
-                (h.is_none() && p.is_file()) || (p.parent().is_some_and(|d| added.iter().any(|a| a == d)) && Targets::changed(p, h))
+                (h.is_none() && p.is_file())
+                    || (p.parent().is_some_and(|d| added.iter().any(|a| a == d))
+                        && mtime(p).is_none_or(|m| m >= verified)
+                        && Targets::changed(p, h))
             })
             .map(|(p, _)| p.clone())
             .chain(t.awaited.iter().filter(|a| present(a)).cloned())

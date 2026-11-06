@@ -76,9 +76,17 @@ impl Doc {
     }
 
     fn clean(&self, args: &[&str]) {
-        let mut c = Command::new(TEXWEFT);
-        c.arg("clean").arg("main.tex").args(args).current_dir(&self.dir).env("PATH", &self.path);
-        assert!(c.status().unwrap().success());
+        assert!(self.cmd("clean", args).status().unwrap().success());
+    }
+
+    /// A build with `pdflatex` replaced by `script` (see `shadow_bin`).
+    fn build_shadowed(&self, name: &str, bin: &Path, script: &str) -> Vec<Value> {
+        let shadow = shadow_bin(name, bin, script);
+        let mut c = self.cmd("build", &[]);
+        c.env("PATH", format!("{}:{}", shadow.display(), self.path));
+        let m = self.build_with(c);
+        let _ = fs::remove_dir_all(shadow);
+        m
     }
 }
 
@@ -135,7 +143,6 @@ fn shadow_bin(name: &str, bin: &Path, script: &str) -> PathBuf {
     }
     let p = d.join("pdflatex");
     fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut fs::metadata(&p).unwrap().permissions(), 0o755);
     fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     d
 }
@@ -148,6 +155,12 @@ const PAPER: &str = "\\documentclass{article}
 \\end{document}
 ";
 const BIB: &str = "@book{knuth, author={D. Knuth}, title={T}, year={1984}, publisher={AW}}\n";
+const CITE: &str = "\\documentclass{article}\\begin{document}See \\cite{knuth}.\\bibliographystyle{plain}\\bibliography{refs}\\end{document}\n";
+
+/// A ready `.bbl`, as arXiv sources ship one, whose entry reads `text`.
+fn bbl(text: &str) -> String {
+    format!("\\begin{{thebibliography}}{{1}}\\bibitem{{knuth}} {text}\\end{{thebibliography}}\n")
+}
 
 fn paper(name: &str, bin: &Path) -> Doc {
     let d = Doc::new(name, bin);
@@ -207,14 +220,10 @@ fn an_input_saved_during_the_build_is_read_before_it_converges() {
         bin.display(),
         f = flag.display()
     );
-    let shadow = shadow_bin("race", &bin, &script);
-    let mut c = d.cmd("build", &[]);
-    c.env("PATH", format!("{}:{}", shadow.display(), d.path));
-    let m = d.build_with(c);
+    let m = d.build_shadowed("race", &bin, &script);
     assert_eq!(finished(&m)["outcome"], "converged");
     assert!(d.read("build/main.log").contains("BODY:after"), "the converged run read the saved version");
     assert_eq!(finished(&d.build(&[]))["steps"], 0, "and the next build trusts it");
-    let _ = fs::remove_dir_all(shadow);
 }
 
 #[test]
@@ -224,13 +233,9 @@ fn an_engine_that_dies_before_its_log_is_not_judged_by_the_old_log() {
     d.write("main.tex", "\\documentclass{article}\\usepackage{zzmissing}\\begin{document}x\\end{document}\n");
     assert_eq!(finished(&d.build(&[]))["outcome"], "missing");
     let script = "echo 'pdflatex: error while loading shared libraries: libfoo.so.1: cannot open shared object file' >&2\nexit 127";
-    let shadow = shadow_bin("stale", &bin, script);
-    let mut c = d.cmd("build", &[]);
-    c.env("PATH", format!("{}:{}", shadow.display(), d.path));
-    let m = d.build_with(c);
+    let m = d.build_shadowed("stale", &bin, script);
     let missing: Vec<_> = m.iter().filter(|x| x["type"] == "missing").map(|x| (x["kind"].clone(), x["name"].clone())).collect();
     assert_eq!(missing, [("library".into(), "libfoo.so.1".into())]);
-    let _ = fs::remove_dir_all(shadow);
 }
 
 #[test]
@@ -290,8 +295,8 @@ fn a_document_that_never_settles_stops_at_the_limit() {
 fn a_shipped_bbl_is_used_when_the_bib_is_absent() {
     let bin = need_tex!();
     let d = Doc::new("arxiv", &bin);
-    d.write("main.tex", "\\documentclass{article}\\begin{document}See \\cite{knuth}.\\bibliographystyle{plain}\\bibliography{refs}\\end{document}\n");
-    d.write("main.bbl", "\\begin{thebibliography}{1}\\bibitem{knuth} Knuth.\\end{thebibliography}\n");
+    d.write("main.tex", CITE);
+    d.write("main.bbl", &bbl("Knuth."));
     let m = d.build(&[]);
     assert_eq!(finished(&m)["outcome"], "converged");
     assert!(steps(&m, "bibtex").is_empty());
@@ -320,8 +325,8 @@ fn clean_removes_only_what_texweft_made() {
 
     // In-source outputs with a shipped .bbl that texweft did not generate.
     let a = Doc::new("clean-arxiv", &bin);
-    a.write("main.tex", "\\documentclass{article}\\begin{document}See \\cite{knuth}.\\bibliographystyle{plain}\\bibliography{refs}\\end{document}\n");
-    a.write("main.bbl", "\\begin{thebibliography}{1}\\bibitem{knuth} Knuth.\\end{thebibliography}\n");
+    a.write("main.tex", CITE);
+    a.write("main.bbl", &bbl("Knuth."));
     assert_eq!(finished(&a.build(&["--outdir", "."]))["outcome"], "converged");
     a.clean(&["--outdir", "."]);
     assert!(a.dir.join("main.bbl").exists(), "the only copy of the bibliography is kept");
@@ -335,36 +340,16 @@ fn watch_rebuilds_on_content_changes_only() {
     d.write("main.tex", "\\documentclass{article}\\begin{document}\\input{body}\\end{document}\n");
     d.write("body.tex", "One.\n");
     let mut child = d.cmd("watch", &[]).stdout(Stdio::piped()).spawn().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<Value>();
-    let out = child.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        for l in BufReader::new(out).lines().map_while(Result::ok) {
-            if tx.send(serde_json::from_str(&l).unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    // Messages until the next `watching`, or None if nothing arrives within `wait`.
-    let next = |wait: Duration| -> Option<Vec<Value>> {
-        let end = Instant::now() + wait;
-        let mut got = Vec::new();
-        while let Ok(m) = rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
-            let done = m["type"] == "watching";
-            got.push(m);
-            if done {
-                return Some(got);
-            }
-        }
-        (!got.is_empty()).then_some(got)
-    };
-    assert_eq!(finished(&next(Duration::from_secs(60)).unwrap())["outcome"], "converged");
+    let rx = messages(child.stdout.take().unwrap());
+    let next = |wait: Duration| until_watching(&rx, wait);
+    assert_eq!(finished(&next(Duration::from_secs(60)))["outcome"], "converged");
     // touch and an identical rewrite are not changes.
     fs::File::options().write(true).open(d.dir.join("body.tex")).unwrap().set_modified(std::time::SystemTime::now()).unwrap();
     d.write("body.tex", "One.\n");
     let unexpected = next(Duration::from_secs(2));
-    assert!(unexpected.is_none(), "no rebuild without a content change: {unexpected:?}");
+    assert!(unexpected.is_empty(), "no rebuild without a content change: {unexpected:?}");
     d.write("body.tex", "Two.\n");
-    let m = next(Duration::from_secs(60)).unwrap();
+    let m = next(Duration::from_secs(60));
     let why = &steps(&m, "pdflatex")[0]["rerun"];
     assert_eq!(why["kind"], "inputs-changed");
     assert!(why["files"][0]["path"].as_str().unwrap().ends_with("body.tex"));
@@ -386,13 +371,9 @@ fn an_input_deleted_during_the_build_is_not_converged() {
     let flag = d.dir.join("delete-once");
     fs::write(&flag, "").unwrap();
     let script = format!("{}/pdflatex \"$@\"; rc=$?\n[ -f {f} ] && {{ rm {f} extra.tex; }}\nexit $rc", bin.display(), f = flag.display());
-    let shadow = shadow_bin("vanish", &bin, &script);
-    let mut c = d.cmd("build", &[]);
-    c.env("PATH", format!("{}:{}", shadow.display(), d.path));
-    let m = d.build_with(c);
+    let m = d.build_shadowed("vanish", &bin, &script);
     assert_ne!(finished(&m)["outcome"], "converged", "the PDF was built from a file that is gone");
     assert_ne!(finished(&d.build(&[]))["steps"], 0);
-    let _ = fs::remove_dir_all(shadow);
 }
 
 #[test]
@@ -418,16 +399,15 @@ fn watch_rebuilds_when_a_missing_image_appears_with_an_extension() {
     assert_eq!(finished(&second)["outcome"], "converged");
 }
 
-const CITE: &str = "\\documentclass{article}\\begin{document}See \\cite{knuth}.\\bibliographystyle{plain}\\bibliography{refs}\\end{document}\n";
 
 #[test]
 fn a_shipped_bbl_at_the_output_path_is_still_an_input() {
     let bin = need_tex!();
     let d = Doc::new("bbl-inplace", &bin);
     d.write("main.tex", CITE);
-    d.write("main.bbl", "\\begin{thebibliography}{1}\\bibitem{knuth} First.\\end{thebibliography}\n");
+    d.write("main.bbl", &bbl("First."));
     assert_eq!(finished(&d.build(&["--outdir", "."]))["outcome"], "converged");
-    d.write("main.bbl", "\\begin{thebibliography}{1}\\bibitem{knuth} Second.\\end{thebibliography}\n");
+    d.write("main.bbl", &bbl("Second."));
     let m = d.build(&["--outdir", "."]);
     assert_eq!(finished(&m)["outcome"], "converged");
     assert_ne!(finished(&m)["steps"], 0, "editing the shipped .bbl rebuilds");
@@ -442,7 +422,7 @@ fn a_shipped_bbl_is_not_shadowed_by_an_old_generated_one() {
     assert_eq!(finished(&d.build(&[]))["outcome"], "converged");
     assert!(d.dir.join("build/main.bbl").exists());
     fs::remove_file(d.dir.join("refs.bib")).unwrap();
-    d.write("main.bbl", "\\begin{thebibliography}{1}\\bibitem{knuth} \\typeout{SHIPPED-BBL}Shipped.\\end{thebibliography}\n");
+    d.write("main.bbl", &bbl("\\typeout{SHIPPED-BBL}Shipped."));
     let m = d.build(&[]);
     assert_eq!(finished(&m)["outcome"], "converged");
     assert!(!d.dir.join("build/main.bbl").exists(), "the generated .bbl no longer hides the shipped one");
@@ -461,4 +441,49 @@ fn clean_does_not_follow_directory_symlinks_out_of_the_output_dir() {
     fs::write(d.dir.join("build/main.fls"), fls).unwrap();
     d.clean(&[]);
     assert!(outside.join("victim.txt").exists(), "a file reached through a symlinked directory is kept");
+}
+
+#[test]
+fn a_one_page_document_needs_one_engine_run() {
+    let bin = need_tex!();
+    let d = Doc::new("one-run", &bin);
+    d.write("main.tex", "\\documentclass{article}\\begin{document}Hello.\\end{document}\n");
+    let m = d.build(&[]);
+    assert_eq!(finished(&m)["outcome"], "converged");
+    assert_eq!(steps(&m, "pdflatex").len(), 1, "the run read the .aux it then wrote");
+}
+
+#[test]
+fn a_failing_document_is_reused_with_its_errors() {
+    let bin = need_tex!();
+    let d = Doc::new("fail-reuse", &bin);
+    d.write("main.tex", "\\documentclass{article}\\begin{document}\\input{body}\\end{document}\n");
+    d.write("body.tex", "\\undefinedmacro Text.\n");
+    assert_eq!(finished(&d.build(&[]))["outcome"], "failed");
+    let m = d.build(&[]);
+    assert_eq!((finished(&m)["outcome"].clone(), finished(&m)["steps"].clone()), ("failed".into(), 0.into()));
+    assert!(!finished(&m)["preview"].is_null(), "the PDF the failed build made is still the preview");
+    let e = m.iter().find(|x| x["type"] == "diagnostic" && x["code"] == "undefined-control-sequence").expect("errors replayed");
+    assert!(e["step"].is_null() && e["span"]["line"] == 1);
+    d.write("body.tex", "Fixed.\n");
+    assert_eq!(finished(&d.build(&[]))["outcome"], "converged");
+}
+
+#[test]
+fn an_edit_that_keeps_size_and_mtime_is_still_seen() {
+    let bin = need_tex!();
+    let d = Doc::new("same-stat", &bin);
+    d.write("main.tex", "\\documentclass{article}\\begin{document}\\input{body}\\end{document}\n");
+    d.write("body.tex", "\\typeout{BODY:aaa}\n");
+    // Old enough that its stat is trusted and its hash is not read again.
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!(finished(&d.build(&[]))["outcome"], "converged");
+    assert_eq!(finished(&d.build(&[]))["steps"], 0);
+    let body = d.dir.join("body.tex");
+    let mtime = fs::metadata(&body).unwrap().modified().unwrap();
+    d.write("body.tex", "\\typeout{BODY:bbb}\n");
+    fs::File::options().write(true).open(&body).unwrap().set_modified(mtime).unwrap();
+    let m = d.build(&[]);
+    assert_eq!(steps(&m, "pdflatex").len(), 1, "the changed ctime gives the edit away");
+    assert!(d.read("build/main.log").contains("BODY:bbb"));
 }
