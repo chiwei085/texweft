@@ -28,8 +28,23 @@ texweft leaves the engines unchanged and edits nothing in the project (no
 
 ## Installation
 
-texweft needs Rust 1.89 or later to build, and a TeX installation with the
-engines on `PATH`:
+texweft needs a TeX installation with the engines on `PATH`. Prebuilt binaries
+are for x86_64 and aarch64 Linux with glibc 2.35 or later (Ubuntu 22.04,
+Debian 12, Fedora 36, or newer). Download the binary for your machine from the
+[latest release](https://github.com/chiwei085/texweft/releases/latest):
+
+```bash
+mkdir -p ~/.local/bin
+curl -fL -o ~/.local/bin/texweft \
+  "https://github.com/chiwei085/texweft/releases/latest/download/texweft-$(uname -m)-linux"
+chmod +x ~/.local/bin/texweft
+texweft --version
+```
+
+Make sure `~/.local/bin` is on your `PATH`. To update, rerun the same commands.
+Each release also lists a `.sha256` checksum for every binary.
+
+To build from source instead, install Rust 1.89 or later and run:
 
 ```bash
 cargo install --git https://github.com/chiwei085/texweft

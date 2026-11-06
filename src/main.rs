@@ -18,6 +18,7 @@ const MAX_ENGINE_RUNS: u32 = 5;
 const USAGE: &str = "usage: texweft build <main.tex> [options]
        texweft watch <main.tex> [options] [--poll]
        texweft clean <main.tex> [--outdir DIR] [--lock-timeout SECS]
+       texweft --version
 options: --engine pdflatex|xelatex|lualatex  --message-format=json|human  --force
          --outdir DIR (default build, relative to the main file's directory)
          --step-timeout SECS  --lock-timeout SECS";
@@ -144,6 +145,10 @@ fn main() -> ExitCode {
         ExitCode::from(2)
     };
     let cmd = it.next().map(String::as_str);
+    if matches!(cmd, Some("--version" | "-V")) {
+        println!("texweft {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     if !matches!(cmd, Some("build" | "watch" | "clean")) {
         return usage("expected the `build`, `watch`, or `clean` command");
     }
