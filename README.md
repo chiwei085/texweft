@@ -109,22 +109,64 @@ build, the state file, locking, `watch`, and `clean`.
 Content hashes decide whether something changed, so `touch`, `git checkout`, and
 saves with identical bytes do not trigger a rebuild. texweft does not read a file
 again while its stat (size, mtime, ctime, inode) is unchanged. A failure caused
-by the document is reused, just as a success is. On a simple document the first
-engine run usually settles in one pass.
+by the document is reused, just as a success is. BibTeX reruns only when the
+citations, style, or databases it reads change, not whenever the `.aux` does.
 
-The table compares wall-clock times with latexmk 4.87, both using TeX Live 2025
-on Linux. "Up to date" means no file changed since the last build.
+When TeX has to run, the engine dominates and both drivers run it about the same
+number of times. texweft then saves the driver's own overhead (about 10–30 ms
+against latexmk's 95–120 ms) and any BibTeX passes that were not needed: 4–16%
+of the wall clock. When nothing needs to run, texweft answers in 2–3 ms against
+latexmk's 50–60 ms, which is what an editor pays on every save or focus change.
 
-| Document | Build from scratch | One-line edit | Up to date |
-| --- | --- | --- | --- |
-| pdfLaTeX + BibTeX, one page | 194 ms vs 345 ms | 65 ms vs 130 ms | 1 ms vs 51 ms |
-| LuaLaTeX + fontspec | 318 ms vs 377 ms | 312 ms vs 370 ms | 2 ms vs 54 ms |
-| XeLaTeX + xeCJK | 290 ms vs 340 ms | 275 ms vs 323 ms | 2 ms vs 50 ms |
-| `book`, 20 `\include`d chapters + BibTeX | 1.60 s vs 1.84 s | 550 ms vs 610 ms | 2 ms vs 53 ms |
+Median wall-clock time of 15 runs, texweft / latexmk 4.87:
 
-Rerunning a document that fails with no changes takes 2 ms with texweft and
-52 ms with latexmk. `watch` starts a build about 100 ms after a save; latexmk
-`-pvc` checks every 2 s by default.
+| Scenario | article (pdfLaTeX) | thesis (pdfLaTeX) | xeCJK (XeLaTeX) | fontspec (LuaLaTeX) |
+| --- | --- | --- | --- | --- |
+| Build from scratch | 1.31 s / 1.51 s | 6.74 s / 7.01 s | 1.41 s / 1.53 s | 2.39 s / 2.61 s |
+| Body text edited | 433 / 517 ms | 2.26 s / 2.36 s | 481 / 565 ms | 805 / 892 ms |
+| New `\label`, `.toc` changes | 1.30 s / 1.50 s | 4.51 s / 4.68 s | 1.32 s / 1.50 s | 1.60 s / 1.76 s |
+| New `\nocite` (BibTeX runs) | 880 ms / 1.01 s | 4.51 s / 4.70 s | 918 ms / 1.03 s | 1.61 s / 1.75 s |
+| Nothing changed | 3 / 52 ms | 3 / 57 ms | 2 / 53 ms | 3 / 58 ms |
+| Every source `touch`ed | 2 / 52 ms | 3 / 53 ms | 2 / 54 ms | 3 / 59 ms |
+| Failing document, unchanged | 3 / 53 ms | 3 / 55 ms | 2 / 57 ms | 3 / 57 ms |
+| One engine run by hand | 421 ms | 2.24 s | 430 ms | 790 ms |
+
+Steps each driver ran (E = engine, B = BibTeX; XeLaTeX adds one `xdvipdfmx`):
+
+| Scenario | texweft | latexmk |
+| --- | --- | --- |
+| Build from scratch | E B E E | E B E B E |
+| Body text edited | E | E |
+| New `\label` (article, xeCJK) | E E E | E B E B E |
+| New `\label` (thesis, fontspec) | E E | E B E |
+| New `\nocite` | E B E | E B E |
+
+The documents are generated and use only what TeX Live ships:
+
+- **article**: 21 pages, 8 `\input` sections with amsmath, TikZ figures,
+  hyperref, a table of contents, and 40 BibTeX entries.
+- **thesis**: `book`, 174 pages, 20 `\include`d chapters with 60 TikZ figures,
+  a list of figures, and 120 BibTeX entries.
+- **xeCJK**: 20 pages of Chinese in Noto Serif CJK TC, with references.
+- **fontspec**: 14 pages in TeX Gyre Termes, with TikZ and references.
+
+How it was measured, on TeX Live 2025, Linux, and an Intel i7-14700K:
+
+- Each tool builds its own copy of each document. Both get the same engine
+  flags (`-interaction=nonstopmode -file-line-error -synctex=1`, `-recorder`,
+  `max_print_line=10000`), and latexmk runs with `-norc` and `-outdir`.
+- Before each timed edit, the tool has converged on the previous state. Edits
+  alternate between two versions of the file, so every timed run is a real change.
+- Each round runs the two tools in random order, so drift in machine load hits
+  both. A warm-up round is discarded. For builds that run TeX, the interquartile
+  range is within 2% of the median, except for xeCJK with a new `\label`, where
+  the number of passes varies for both tools.
+- Every build must exit as expected, and both PDFs must have the same page count.
+
+`watch` reacts to file events: from saving a body edit in the article to the
+finished PDF takes 550 ms (median; IQR 543–558 ms), which is one engine run plus
+about 130 ms. latexmk `-pvc` polls every 2 s by default, so the same edit takes
+1.18 s (median; IQR 0.83–1.78 s, worst 1.93 s).
 
 ## Scope
 
