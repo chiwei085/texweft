@@ -1,0 +1,37 @@
+\bibindent=\dimen140
+)
+
+! LaTeX Error: File `zzmissing.sty' not found.
+
+Type X to quit or <RETURN> to proceed,
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 1.
+LaTeX Font Info:    ... okay on input line 1.
+./a.tex:1: I can't find file `zznofile'.
+l.1 ...ass{article}\begin{document}\input zznofile
+                                                  
+(Press Enter to retry, or Control-D to exit)
+Please type another input file name
+./a.tex:1: Emergency stop.
+l.1 ...ass{article}\begin{document}\input zznofile
+                                                  
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 1.
+LaTeX Font Info:    ... okay on input line 1.
+./b.tex:1: Font \x=zzfont at 12.0pt not loadable: Metric (TFM) file not found.
+l.1 ...cle}\begin{document}\font\x=zzfont at 12pt 
+                                                  \font\y=zzfontb \x hi\end{...
+I wasn't able to read the size data for this font,
+so I will ignore the font specification.
+[Wizards can fix TFM files using TFtoPL/PLtoTF.]
+You might try inserting a different font spec;
+e.g., type `I\font<same font id>=<substitute font name>'.
+
+./b.tex:1: Font \y=zzfontb not loadable: Metric (TFM) file not found.
+<to be read again> 
+                   \x 
+l.1 ...t}\font\x=zzfont at 12pt \font\y=zzfontb \x
+ [1{/home/user/.cache/texup/tl/2023/texmf-var/fonts/map/pdftex/updmap/pdftex.map}] (./x.aux) )</home/user/.texlive2023/texmf-var/fonts/pk/ljfour/public/cm/cmr12.600pk></home/user/.cache/texup/tl/2023/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb>
+!pdfTeX error: pdflatex (file tcrm1200): Font tcrm1200 at 600 not found
+./main.tex:4: Font TU/TeXGyreTermes(0)/m/n/10="TeX Gyre Termes" at 10.0pt not loadable: Metric (TFM) file or installed font not found.
+./main.tex:4: Font TU/texgyretermes-regular.otf(0)/m/n/10=[texgyretermes-regular.otf]/OT at 10.0pt not loadable: Metric (TFM) file or installed font not found.
+./main.tex:4: Font \TU/texgyrepagella-regular.otf(0)/m/n/10=[texgyrepagella-regular.otf]:mode=node;language=dflt;+tlig; at 10pt not loadable: metric data not found or bad.
+./main.tex:4: Font \TU/TeXGyreTermes(0)/m/n/10=name:TeX Gyre Termes:mode=node;language=dflt;+tlig; at 10pt not loadable: metric data not found or bad.
