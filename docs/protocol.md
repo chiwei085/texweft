@@ -316,8 +316,12 @@ tool that dies before writing one never reports the previous run's messages;
 ### dep-info
 
 ```json
-{"v":0,"type":"dep-info","inputs":[{"path":"/home/u/.texup/2023/texmf-dist/tex/latex/siunitx/siunitx.sty","via":"fls"},{"path":"/w/paper/refs.bib","via":"bibtex"},{"path":"/home/u/.texup/2023/texmf-dist/fonts/opentype/public/tex-gyre/texgyretermes-regular.otf","via":"xdv"}]}
+{"v":0,"type":"dep-info","inputs":[{"path":"/home/u/.texup/2023/texmf-dist/tex/latex/siunitx/siunitx.sty","via":"fls"},{"path":"/w/paper/refs.bib","via":"bibtex"},{"path":"/home/u/.texup/2023/texmf-dist/fonts/opentype/public/tex-gyre/texgyretermes-regular.otf","via":"xdv"}],"programs":["xelatex","bibtex","xdvipdfmx"]}
 ```
+
+`programs` lists the programs this document's build needs (engine, the
+bibliography tool in use, `xdvipdfmx` for XeLaTeX), whether or not this build
+had to run them; an up-to-date build reports the last converged build's list.
 
 `via` identifies the source: `fls`, `log` (LuaTeX `</…otf>` lines), `xdv`
 (opcode 252), or `bibtex` / `biber` (bibliography inputs absent from `.fls`).

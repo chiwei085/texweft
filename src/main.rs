@@ -510,7 +510,8 @@ impl Build {
             return Some(json!({"kind": "forced"}));
         }
         let no_prev = Some(json!({"kind": "no-previous-run"}));
-        let Some(s) = state else { return no_prev };
+        // A state written by an older texweft may lack what an up-to-date build must report.
+        let Some(s) = state.filter(|s| s["programs"].is_array()) else { return no_prev };
         if s["tex_root"] != json!(root) {
             return Some(json!({"kind": "toolchain-changed", "was": s["tex_root"], "now": root}));
         }
@@ -692,7 +693,8 @@ impl Build {
             let inputs: Vec<Value> = state.as_ref().and_then(|s| s["inputs"].as_array()).into_iter().flatten()
                 .map(|i| json!({"path": i["path"], "via": i["via"]}))
                 .collect();
-            self.emit("dep-info", json!({"inputs": inputs}));
+            let programs = state.as_ref().map(|s| s["programs"].clone()).unwrap_or(json!([]));
+            self.emit("dep-info", json!({"inputs": inputs, "programs": programs}));
             self.emit("build-finished", json!({"outcome": "converged", "success": true, "steps": 0, "preview": self.path("pdf")}));
             let seen = state.as_ref().and_then(|s| s["inputs"].as_array()).into_iter().flatten();
             let seen = seen.filter_map(|i| Some((PathBuf::from(i["path"].as_str()?), i["hash"].as_str().map(String::from))));
@@ -979,7 +981,14 @@ impl Build {
         let mut seen = std::collections::BTreeSet::new();
         deps.retain(|(p, _)| seen.insert(p.clone()));
         let inputs: Vec<Value> = deps.iter().map(|(p, via)| json!({"path": p, "via": via})).collect();
-        self.emit("dep-info", json!({"inputs": inputs}));
+        // The programs this document's build needs, whether or not this build had to run them: an
+        // incremental build that skips BibTeX still needs it (a lockfile must keep its package).
+        let mut programs = vec![engine.clone()];
+        programs.extend(self.bib_tool(&fls).filter(|_| !self.shipped_bbl).map(String::from));
+        if engine == "xelatex" {
+            programs.push("xdvipdfmx".into());
+        }
+        self.emit("dep-info", json!({"inputs": inputs, "programs": programs}));
 
         // An input modified after the last verification may not be what the engine read: record no
         // hash, so the next build reruns. mtimes past the build's end (clock skew, unpacked archives)
@@ -997,7 +1006,7 @@ impl Build {
                     *v = None;
                 }
             }
-            let state = json!({"tex_root": root, "engine": engine, "pdf": hash(&self.path("pdf")), "inputs": inputs, "bib": bib});
+            let state = json!({"tex_root": root, "engine": engine, "pdf": hash(&self.path("pdf")), "inputs": inputs, "programs": programs, "bib": bib});
             let _ = fs::write(&state_path, state.to_string());
         }
         let mut done = json!({"outcome": outcome, "success": outcome == "converged", "steps": self.step, "preview": preview});

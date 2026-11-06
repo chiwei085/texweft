@@ -168,6 +168,15 @@ fn converges_into_build_dir_then_is_up_to_date() {
     assert!(!d.dir.join("main.aux").exists(), "sources stay clean");
     let m = d.build(&[]);
     assert_eq!((finished(&m)["outcome"].clone(), finished(&m)["steps"].clone()), ("converged".into(), 0.into()));
+    // An up-to-date build still reports everything a lockfile needs.
+    let dep = m.iter().find(|x| x["type"] == "dep-info").unwrap();
+    assert_eq!(dep["programs"], serde_json::json!(["pdflatex", "bibtex"]));
+    assert!(dep["inputs"].as_array().unwrap().iter().any(|i| i["via"] == "bibtex"));
+    // So does an incremental build that did not need BibTeX.
+    d.write("ch/one.tex", "Chapter, edited.\n");
+    let m = d.build(&[]);
+    assert!(steps(&m, "bibtex").is_empty());
+    assert_eq!(m.iter().find(|x| x["type"] == "dep-info").unwrap()["programs"], serde_json::json!(["pdflatex", "bibtex"]));
 }
 
 #[test]
