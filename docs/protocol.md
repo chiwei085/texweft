@@ -345,6 +345,8 @@ had to run them; an up-to-date build reports the last converged build's list.
 
 `via` identifies the source: `fls`, `log` (LuaTeX `</…otf>` lines), `xdv`
 (opcode 252), or `bibtex` / `biber` (bibliography inputs absent from `.fls`).
+LuaTeX outline fonts come from the embedded-font log: a cold luaotfload database
+scan also records unrelated fonts in `.fls`, which must not enter a lockfile.
 This message supplies all inputs needed for texup's lockfile.
 
 ### Engine run limit

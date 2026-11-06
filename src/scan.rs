@@ -132,6 +132,17 @@ pub fn log_fonts(log: &str) -> BTreeSet<String> {
     out
 }
 
+/// A cold luaotfload database scan records every installed outline font in `.fls`.
+/// Use the embedded-font log for those, as on a warm cache.
+pub fn lua_inputs(paths: impl Iterator<Item = PathBuf>, log: &str) -> Vec<(PathBuf, &'static str)> {
+    let mut inputs: Vec<_> = paths
+        .filter(|p| !matches!(p.extension().and_then(|s| s.to_str()), Some("otf" | "ttf" | "ttc")))
+        .map(|p| (p, "fls"))
+        .collect();
+    inputs.extend(log_fonts(log).into_iter().map(|p| (p.into(), "log")));
+    inputs
+}
+
 // XDV opcode 252: k[4] size[4] flags[2] len[1] path[len].
 pub fn xdv_fonts(xdv: &[u8]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -412,6 +423,17 @@ mod tests {
         let got = log_fonts(include_str!("../tests/fixtures/lualatex-tail.log"));
         let names: Vec<_> = got.iter().map(|p| p.rsplit('/').next().unwrap()).collect();
         assert_eq!(names, ["lmroman10-regular.otf", "NotoSerifCJK-Regular.ttc"]);
+    }
+
+    #[test]
+    fn lua_font_dependencies_do_not_depend_on_the_font_database_cache() {
+        let source = PathBuf::from("/paper/main.tex");
+        let scanned = ["/tl/fonts/unused.otf", "/tl/fonts/unused.ttf", "/tl/fonts/unused.ttc", "/tl/fonts/used.otf"];
+        let log = "</tl/fonts/used.otf>\n";
+        let warm = lua_inputs([source.clone()].into_iter(), log);
+        let cold = lua_inputs(std::iter::once(source).chain(scanned.map(PathBuf::from)), log);
+        assert_eq!(cold, warm);
+        assert!(cold.contains(&(PathBuf::from("/tl/fonts/used.otf"), "log")));
     }
 
     #[test]

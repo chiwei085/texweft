@@ -345,7 +345,7 @@ fn first_line(c: &mut Command) -> Option<String> {
 
 /// Bumped whenever the state gains something an up-to-date build must report; an older state
 /// then counts as no previous run.
-const STATE_VERSION: u64 = 2;
+const STATE_VERSION: u64 = 3;
 
 fn read_state(p: &Path) -> Option<Value> {
     fs::read(p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(|s| s["v"] == STATE_VERSION)
@@ -1150,10 +1150,12 @@ impl Build {
             }
         }
 
-        let mut deps: Vec<(PathBuf, &str)> = self.engine_inputs(&fls).into_iter().map(|p| (p, "fls")).collect();
-        if engine == "lualatex" {
-            deps.extend(scan::log_fonts(&log).into_iter().map(|p| (p.into(), "log")));
-        }
+        let paths = self.engine_inputs(&fls).into_iter();
+        let mut deps: Vec<(PathBuf, &str)> = if engine == "lualatex" {
+            scan::lua_inputs(paths, &log)
+        } else {
+            paths.map(|p| (p, "fls")).collect()
+        };
         deps.extend(scan::xdv_fonts(&xdv_bytes).into_iter().map(|p| (p.into(), "xdv")));
         deps.extend(bib_reads.iter().cloned());
         let mut seen = std::collections::BTreeSet::new();
