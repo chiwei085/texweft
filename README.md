@@ -142,3 +142,7 @@ that is not on `PATH`, point `TEXWEFT_TEST_TEXBIN` at its binaries:
 ```bash
 TEXWEFT_TEST_TEXBIN=~/.cache/texup/tl/2025/bin/x86_64-linux cargo test --release
 ```
+
+## License
+
+[MIT](LICENSE)
