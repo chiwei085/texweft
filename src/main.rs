@@ -231,6 +231,9 @@ struct Build {
     step_timeout: Option<Duration>,
     lock_timeout: Option<Duration>,
     step: u32,
+    /// LaTeX reads a `.bbl` shipped next to the main file, not one a bibliography tool made: it
+    /// is then an input like any source, even when it sits at the output path (`--outdir .`).
+    shipped_bbl: bool,
 }
 
 struct Ran {
@@ -362,6 +365,7 @@ impl Build {
             step_timeout: o.step_timeout,
             lock_timeout: o.lock_timeout,
             step: 0,
+            shipped_bbl: false,
         }
     }
 
@@ -547,8 +551,8 @@ impl Build {
     /// What one engine run read: `.fls` inputs that no step of the build writes.
     fn engine_inputs(&self, fls: &str) -> Vec<PathBuf> {
         let outputs = scan::fls_paths(fls, "OUTPUT");
-        let bbl = self.path("bbl");
-        scan::fls_paths(fls, "INPUT").into_iter().filter(|p| !outputs.contains(p) && *p != bbl).collect()
+        let made = (!self.shipped_bbl).then(|| self.path("bbl"));
+        scan::fls_paths(fls, "INPUT").into_iter().filter(|p| !outputs.contains(p) && Some(p) != made.as_ref()).collect()
     }
 
     /// Inputs that may have changed while a step ran, so its result may not match them: a known
@@ -562,10 +566,11 @@ impl Build {
                 let now = hash(p);
                 match before.get(p) {
                     Some(was) => (*was != now).then(|| json!({"path": p, "was": was, "now": now})),
-                    None => fs::metadata(p)
-                        .and_then(|m| m.modified())
-                        .is_ok_and(|t| t >= from && t <= to)
-                        .then(|| json!({"path": p, "was": null, "now": now})),
+                    // First seen in this step: modified inside it, or already gone again.
+                    None => match fs::metadata(p).and_then(|m| m.modified()) {
+                        Ok(t) => (t >= from && t <= to).then(|| json!({"path": p, "was": null, "now": now})),
+                        Err(_) => Some(json!({"path": p, "was": null, "now": null})),
+                    },
                 }
             })
             .collect()
@@ -729,6 +734,7 @@ impl Build {
             .flatten()
             .filter_map(|i| i["path"].as_str().map(PathBuf::from))
             .collect();
+        self.shipped_bbl = !self.provided_bbl().is_empty();
         known.extend(self.engine_inputs(&read(&self.path("fls"))));
         // Whether the latest engine run reported an error; the build is `failed` if the last one did.
         let mut errored = false;
@@ -814,8 +820,21 @@ impl Build {
             let mut tool = self.bib_tool(&fls);
             if tool == Some("bibtex") {
                 let unfound = self.provided_bbl();
-                if !unfound.is_empty() {
+                self.shipped_bbl = !unfound.is_empty();
+                if self.shipped_bbl {
                     tool = None;
+                    // Nothing generates the .bbl any more: forget BibTeX's state, so clean keeps the
+                    // shipped file, and drop a .bbl BibTeX left in the output directory, which
+                    // LaTeX would find before the shipped one.
+                    bib.clear();
+                    bib_reads.clear();
+                    let made = self.path("bbl");
+                    if made != self.dir.join(format!("{}.bbl", self.job)) && made.exists() {
+                        let was = hash(&made);
+                        if fs::remove_file(&made).is_ok() {
+                            files.push(json!({"path": made, "was": was, "now": null}));
+                        }
+                    }
                     if !used_provided_bbl {
                         used_provided_bbl = true;
                         let bbl = self.dir.join(format!("{}.bbl", self.job));
@@ -949,12 +968,7 @@ impl Build {
             }
         }
 
-        let outputs = scan::fls_paths(&fls, "OUTPUT");
-        let mut deps: Vec<(PathBuf, &str)> = scan::fls_paths(&fls, "INPUT")
-            .into_iter()
-            .filter(|p| !outputs.contains(p) && *p != self.path("bbl"))
-            .map(|p| (p, "fls"))
-            .collect();
+        let mut deps: Vec<(PathBuf, &str)> = self.engine_inputs(&fls).into_iter().map(|p| (p, "fls")).collect();
         if engine == "lualatex" {
             deps.extend(scan::log_fonts(&log).into_iter().map(|p| (p.into(), "log")));
         }
@@ -1011,9 +1025,13 @@ fn clean(main: &Path, o: &Opts) -> bool {
         eprintln!("texweft: another build is still using these outputs; nothing removed");
         return false;
     };
-    // Only paths that stay inside the output directory: `out/../x` starts with `out` as a path
-    // prefix but names a file outside it.
-    let inside = |p: &Path| p.starts_with(&out) && !p.components().any(|c| c == std::path::Component::ParentDir);
+    // Only files whose directory, with symlinks resolved, is inside the output directory:
+    // `out/../x` and `out/link/x` (link → elsewhere) start with `out` but name files outside it.
+    // The file itself may be a symlink; removing it removes the link, not its target.
+    let inside = |p: &Path| {
+        !p.components().any(|c| c == std::path::Component::ParentDir)
+            && p.parent().and_then(|d| fs::canonicalize(d).ok()).is_some_and(|d| d.starts_with(&out))
+    };
     let mut files: std::collections::BTreeSet<PathBuf> =
         scan::fls_paths(&read(&path("fls")), "OUTPUT").into_iter().filter(|p| inside(p)).collect();
     let fixed = ["fls", "log", "aux", "blg", "bcf", "run.xml", "pdf", "xdv", "synctex.gz"];

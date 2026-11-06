@@ -88,6 +88,33 @@ impl Drop for Doc {
     }
 }
 
+/// The JSON messages of a running `watch`, read on a thread so tests can time out.
+fn messages(out: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Value> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for l in BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send(serde_json::from_str(&l).unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// Messages up to and including the next `watching`, or whatever arrived before `wait` ran out.
+fn until_watching(rx: &std::sync::mpsc::Receiver<Value>, wait: Duration) -> Vec<Value> {
+    let end = Instant::now() + wait;
+    let mut got = Vec::new();
+    while let Ok(m) = rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+        let done = m["type"] == "watching";
+        got.push(m);
+        if done {
+            break;
+        }
+    }
+    got
+}
+
 fn finished(msgs: &[Value]) -> &Value {
     msgs.iter().rfind(|m| m["type"] == "build-finished").expect("build-finished")
 }
@@ -335,4 +362,94 @@ fn watch_rebuilds_on_content_changes_only() {
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(143), "{status:?}");
+}
+
+#[test]
+fn an_input_deleted_during_the_build_is_not_converged() {
+    let bin = need_tex!();
+    let d = Doc::new("vanish", &bin);
+    d.write("main.tex", "\\documentclass{article}\\begin{document}Main.\\end{document}\n");
+    assert_eq!(finished(&d.build(&[]))["outcome"], "converged");
+    // A new input appears; the engine reads it, then it is deleted before the build ends. Nothing
+    // else asks for another run (.aux unchanged), so only verification can notice.
+    d.write("main.tex", "\\documentclass{article}\\begin{document}Main.\\input{extra}\\end{document}\n");
+    d.write("extra.tex", "Extra.\n");
+    let flag = d.dir.join("delete-once");
+    fs::write(&flag, "").unwrap();
+    let script = format!("{}/pdflatex \"$@\"; rc=$?\n[ -f {f} ] && {{ rm {f} extra.tex; }}\nexit $rc", bin.display(), f = flag.display());
+    let shadow = shadow_bin("vanish", &bin, &script);
+    let mut c = d.cmd("build", &[]);
+    c.env("PATH", format!("{}:{}", shadow.display(), d.path));
+    let m = d.build_with(c);
+    assert_ne!(finished(&m)["outcome"], "converged", "the PDF was built from a file that is gone");
+    assert_ne!(finished(&d.build(&[]))["steps"], 0);
+    let _ = fs::remove_dir_all(shadow);
+}
+
+#[test]
+fn watch_rebuilds_when_a_missing_image_appears_with_an_extension() {
+    let bin = need_tex!();
+    let img = Command::new(bin.join("kpsewhich")).arg("example-image-a.pdf").output().unwrap();
+    let img = String::from_utf8_lossy(&img.stdout).trim().to_string();
+    if img.is_empty() {
+        eprintln!("skipped: example-image-a.pdf (mwe) not installed");
+        return;
+    }
+    let d = Doc::new("watch-img", &bin);
+    d.write("main.tex", "\\documentclass{article}\\usepackage{graphicx}\\begin{document}\\includegraphics{fig}\\end{document}\n");
+    let mut child = d.cmd("watch", &[]).stdout(Stdio::piped()).spawn().unwrap();
+    let rx = messages(child.stdout.take().unwrap());
+    let first = until_watching(&rx, Duration::from_secs(60));
+    fs::copy(&img, d.dir.join("fig.pdf")).unwrap();
+    let second = until_watching(&rx, Duration::from_secs(10));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    child.wait().unwrap();
+    assert_eq!(finished(&first)["outcome"], "missing");
+    assert!(second.iter().any(|m| m["type"] == "build-finished"), "no rebuild after fig.pdf appeared");
+    assert_eq!(finished(&second)["outcome"], "converged");
+}
+
+const CITE: &str = "\\documentclass{article}\\begin{document}See \\cite{knuth}.\\bibliographystyle{plain}\\bibliography{refs}\\end{document}\n";
+
+#[test]
+fn a_shipped_bbl_at_the_output_path_is_still_an_input() {
+    let bin = need_tex!();
+    let d = Doc::new("bbl-inplace", &bin);
+    d.write("main.tex", CITE);
+    d.write("main.bbl", "\\begin{thebibliography}{1}\\bibitem{knuth} First.\\end{thebibliography}\n");
+    assert_eq!(finished(&d.build(&["--outdir", "."]))["outcome"], "converged");
+    d.write("main.bbl", "\\begin{thebibliography}{1}\\bibitem{knuth} Second.\\end{thebibliography}\n");
+    let m = d.build(&["--outdir", "."]);
+    assert_eq!(finished(&m)["outcome"], "converged");
+    assert_ne!(finished(&m)["steps"], 0, "editing the shipped .bbl rebuilds");
+}
+
+#[test]
+fn a_shipped_bbl_is_not_shadowed_by_an_old_generated_one() {
+    let bin = need_tex!();
+    let d = Doc::new("bbl-shadow", &bin);
+    d.write("main.tex", CITE);
+    d.write("refs.bib", BIB);
+    assert_eq!(finished(&d.build(&[]))["outcome"], "converged");
+    assert!(d.dir.join("build/main.bbl").exists());
+    fs::remove_file(d.dir.join("refs.bib")).unwrap();
+    d.write("main.bbl", "\\begin{thebibliography}{1}\\bibitem{knuth} \\typeout{SHIPPED-BBL}Shipped.\\end{thebibliography}\n");
+    let m = d.build(&[]);
+    assert_eq!(finished(&m)["outcome"], "converged");
+    assert!(!d.dir.join("build/main.bbl").exists(), "the generated .bbl no longer hides the shipped one");
+    assert!(d.read("build/main.log").contains("SHIPPED-BBL"), "LaTeX read the shipped .bbl");
+}
+
+#[test]
+fn clean_does_not_follow_directory_symlinks_out_of_the_output_dir() {
+    let bin = need_tex!();
+    let d = paper("clean-link", &bin);
+    assert_eq!(finished(&d.build(&[]))["outcome"], "converged");
+    let outside = d.dir.join("outside");
+    d.write("outside/victim.txt", "mine\n");
+    std::os::unix::fs::symlink(&outside, d.dir.join("build/link")).unwrap();
+    let fls = d.read("build/main.fls") + &format!("OUTPUT {}/build/link/victim.txt\n", d.dir.display());
+    fs::write(d.dir.join("build/main.fls"), fls).unwrap();
+    d.clean(&[]);
+    assert!(outside.join("victim.txt").exists(), "a file reached through a symlinked directory is kept");
 }

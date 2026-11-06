@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
-use std::env;
+use std::{env, fs};
 
 /// Quiet time after the last relevant event before building: editors save in several writes.
 const SETTLE: Duration = Duration::from_millis(100);
@@ -74,8 +74,7 @@ impl Targets {
         if let Some(was) = self.inputs.get(p) {
             return if Self::changed(p, was) { Change::Rebuild } else { Change::None };
         }
-        // `fig` from graphicx has no extension; `fig.png` appearing satisfies it.
-        if p.is_file() && self.awaited.iter().any(|a| a == p || (a.extension().is_none() && p.with_extension("") == *a)) {
+        if p.is_file() && self.awaited.iter().any(|a| satisfies(p, a)) {
             return Change::Rebuild;
         }
         // A directory on the way to an awaited path appeared: watch it, nothing to build yet.
@@ -87,8 +86,23 @@ impl Targets {
 
     /// Full comparison, for when the event stream lost track (queue overflow, watcher error).
     fn any_changed(&self) -> bool {
-        self.inputs.iter().any(|(p, was)| Self::changed(p, was)) || self.awaited.iter().any(|a| a.exists())
+        self.inputs.iter().any(|(p, was)| Self::changed(p, was)) || self.awaited.iter().any(|a| present(a))
     }
+}
+
+/// Whether file `p` provides awaited path `a`. `fig` from graphicx has no extension;
+/// `fig.png` appearing satisfies it.
+fn satisfies(p: &Path, a: &Path) -> bool {
+    p == a || (a.extension().is_none() && p.with_extension("") == a)
+}
+
+/// Whether some file now provides awaited path `a`, by the same rule as events use.
+fn present(a: &Path) -> bool {
+    a.is_file()
+        || (a.extension().is_none()
+            && a.parent().and_then(|d| fs::read_dir(d).ok()).is_some_and(|es| {
+                es.flatten().any(|e| e.file_type().is_ok_and(|t| t.is_file()) && satisfies(&e.path(), a))
+            }))
 }
 
 struct Backend {
@@ -246,7 +260,7 @@ pub fn run(main: &Path, o: &Opts, force: bool) -> ! {
                 (h.is_none() && p.is_file()) || (p.parent().is_some_and(|d| added.iter().any(|a| a == d)) && Targets::changed(p, h))
             })
             .map(|(p, _)| p.clone())
-            .chain(t.awaited.iter().filter(|a| a.is_file()).cloned())
+            .chain(t.awaited.iter().filter(|a| present(a)).cloned())
             .collect();
         unseen_runs.retain(|p, _| unseen.contains(p));
         let mut again = false;
@@ -270,7 +284,7 @@ pub fn run(main: &Path, o: &Opts, force: bool) -> ! {
         // A directory on the way to an awaited file appeared; the file may already be inside it.
         while wait(&rx, &t, &mut watched) == Change::Resync {
             backend.sync(&mut watched, &t);
-            if t.awaited.iter().any(|a| a.is_file()) {
+            if t.awaited.iter().any(|a| present(a)) {
                 break;
             }
         }

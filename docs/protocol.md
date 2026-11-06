@@ -78,6 +78,9 @@ and followed by a `watching` message:
   awaited file created before its directory was watched. These trigger an
   immediate rebuild, at most twice in a row per path, so a file the build keeps
   rewriting cannot loop.
+- An awaited file without an extension (graphicx's `fig`) is satisfied by any
+  file with that stem (`fig.pdf`), both when an event arrives and when content
+  is compared again.
 - Events settle for 100 ms (at most 1 s), then the content is compared again
   before building: a save truncates and then writes, so an event can see an
   empty file that is whole again by the time it settles.
@@ -88,8 +91,9 @@ and followed by a `watching` message:
   and exits with 141 when it does not.
 
 `clean` removes only what texweft manages in the output directory: the `.fls`
-`OUTPUT` files inside it (paths with `..` are ignored, so a forged or odd entry
-cannot reach outside), the PDF, `.blg`, and the state file, then the
+`OUTPUT` files inside it (a path with `..`, or whose directory resolves through a
+symlink to somewhere else, is ignored, so a forged or odd entry cannot reach
+outside), the PDF, `.blg`, and the state file, then the
 subdirectories that held only those (`rmdir`, so anything else keeps them). The
 `.bbl` goes only when the state file shows texweft generated it with BibTeX or
 Biber: a shipped `.bbl` may be the only copy of the bibliography. The output
@@ -189,7 +193,8 @@ read changed, and its new `.bbl` triggers an engine rerun.
 Each step's inputs are verified after it runs. Every input known before the step
 (from the last converged build, the previous run's `.fls`, and the databases the
 bibliography tool read) is hashed just before it; afterwards, an input whose hash
-differs, or an input first seen in this step whose mtime falls inside it, means
+differs, or an input first seen in this step whose mtime falls inside it or that
+is already gone again, means
 the result may not match the sources, and the engine reruns (within the limit,
 `rerun.kind: "inputs-changed"`). `converged` therefore means: the last run
 settled, and when it was verified no input had changed since it started. Hashes
@@ -209,7 +214,10 @@ still stop the build at once.
 When `\bibdata` names databases that cannot be found but a `<job>.bbl` ships next
 to the main file (arXiv sources do), BibTeX is skipped and LaTeX reads that
 file; each unfound database is reported as `missing` with `fatal: false` and
-`substitute: "bbl"`.
+`substitute: "bbl"`. The shipped `.bbl` is then an input like any source, also
+when it sits at the output path (`--outdir .`). A `.bbl` BibTeX generated earlier
+in the output directory would be found first, so it is removed and the engine
+reruns; BibTeX's recorded state is dropped, so `clean` keeps the shipped file.
 
 Across builds, the driver keeps `<job>.texweft.json` in the output directory,
 written only after `converged`. An input whose mtime is later than the last
