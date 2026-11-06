@@ -78,8 +78,9 @@ and followed by a `watching` message:
   awaited file created before its directory was watched. These trigger an
   immediate rebuild, at most twice in a row per path, so a file the build keeps
   rewriting cannot loop.
-- Events settle for 100 ms (at most 1 s) before a build, so a burst of writes
-  from one save is one build.
+- Events settle for 100 ms (at most 1 s), then the content is compared again
+  before building: a save truncates and then writes, so an event can see an
+  empty file that is whole again by the time it settles.
 - Native events (inotify, FSEvents, ReadDirectoryChangesW) by default; polling
   every 500 ms with `--poll` (NFS, WSL `/mnt/c`, container mounts), or
   automatically when the OS watch limit is reached.
@@ -87,9 +88,12 @@ and followed by a `watching` message:
   and exits with 141 when it does not.
 
 `clean` removes only what texweft manages in the output directory: the `.fls`
-`OUTPUT` files inside it, the PDF, `.bbl`, `.blg`, and the state file, then the
+`OUTPUT` files inside it (paths with `..` are ignored, so a forged or odd entry
+cannot reach outside), the PDF, `.blg`, and the state file, then the
 subdirectories that held only those (`rmdir`, so anything else keeps them). The
-output directory and the lock file stay. It prints removed paths to stderr and
+`.bbl` goes only when the state file shows texweft generated it with BibTeX or
+Biber: a shipped `.bbl` may be the only copy of the bibliography. The output
+directory and the lock file stay. It prints removed paths to stderr and
 emits no protocol messages.
 
 Process lifecycle, for `build` and `watch` alike:
@@ -182,10 +186,35 @@ do not count. A bibliography step runs when its control data (`\citation`,
 `\bibdata`, `\bibstyle` lines of the `.aux` tree, or the `.bcf`) or a database it
 read changed, and its new `.bbl` triggers an engine rerun.
 
+Each step's inputs are verified after it runs. Every input known before the step
+(from the last converged build, the previous run's `.fls`, and the databases the
+bibliography tool read) is hashed just before it; afterwards, an input whose hash
+differs, or an input first seen in this step whose mtime falls inside it, means
+the result may not match the sources, and the engine reruns (within the limit,
+`rerun.kind: "inputs-changed"`). `converged` therefore means: the last run
+settled, and when it was verified no input had changed since it started. Hashes
+before and after cannot prove the engine read one consistent version, and
+nothing is promised about edits after the verification; those are caught by the
+next build.
+
+An engine error does not stop the build when the run left what the next steps
+need: an `.aux` it wrote and no abort (`Emergency stop`, `Fatal error occurred`,
+a timeout), after which TeX's files are truncated. BibTeX and reruns then
+complete citations and cross-references in the preview, as `latexmk -f` and
+Overleaf do. The outcome is `failed` whenever the last engine run reports an
+error; earlier runs' errors that the final run no longer has (stale `.aux`)
+do not count. Fatal `missing`, `unsupported`, and failing bibliography tools
+still stop the build at once.
+
+When `\bibdata` names databases that cannot be found but a `<job>.bbl` ships next
+to the main file (arXiv sources do), BibTeX is skipped and LaTeX reads that
+file; each unfound database is reported as `missing` with `fatal: false` and
+`substitute: "bbl"`.
+
 Across builds, the driver keeps `<job>.texweft.json` in the output directory,
-written only after `converged`. An input whose mtime is later than the build's
-start is recorded without a hash, so a file saved mid-build triggers the next
-build instead of being taken as up to date. When the toolchain, every recorded input, and the
+written only after `converged`. An input whose mtime is later than the last
+verification is recorded without a hash, so a file saved after it triggers the
+next build instead of being taken as up to date. When the toolchain, every recorded input, and the
 PDF are unchanged, nothing runs: `steps` is 0, artifacts are reported with
 `fresh: false`, and `preview` is the PDF.
 
@@ -308,7 +337,7 @@ that install dependencies and retry bound their own loop. 5 follows latexmk's
 |---|---|---|
 | `converged` | true | All steps succeeded and rerun conditions stabilized |
 | `missing` | false | A fatal dependency is missing; the caller can install it and retry |
-| `failed` | false | An error occurred or a tool exited with a nonzero status |
+| `failed` | false | The last engine run reported an error, or a tool failed; the preview may still be complete |
 | `not-converged` | false | The engine run limit was reached; includes `last_rerun`, the final `rerun` object |
 | `unsupported` | false | An unsupported workflow was detected |
 | `busy` | false | Another texweft held the output lock past `--lock-timeout`; nothing ran |

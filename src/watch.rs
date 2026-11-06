@@ -164,7 +164,15 @@ fn wait(rx: &Receiver<Events>, t: &Targets, watched: &mut BTreeSet<PathBuf>) -> 
             Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
         };
         let change = match ev {
-            Err(RecvTimeoutError::Timeout) if deadline.is_some() => return Change::Rebuild,
+            // Settled: decide by content now, not by what an event saw. A save truncates then writes,
+            // so the event may have seen an empty file, and A→B→A ends where it began.
+            Err(RecvTimeoutError::Timeout) if deadline.is_some() => {
+                if t.any_changed() {
+                    return Change::Rebuild;
+                }
+                (first, deadline) = (None, None);
+                Change::None
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if consumer_gone() {
                     shutdown(141);

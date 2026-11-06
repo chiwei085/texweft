@@ -544,6 +544,33 @@ impl Build {
         files
     }
 
+    /// What one engine run read: `.fls` inputs that no step of the build writes.
+    fn engine_inputs(&self, fls: &str) -> Vec<PathBuf> {
+        let outputs = scan::fls_paths(fls, "OUTPUT");
+        let bbl = self.path("bbl");
+        scan::fls_paths(fls, "INPUT").into_iter().filter(|p| !outputs.contains(p) && *p != bbl).collect()
+    }
+
+    /// Inputs that may have changed while a step ran, so its result may not match them: a known
+    /// input whose hash differs from the one taken just before the step, or an input first seen in
+    /// this step whose mtime falls inside it. Hashes before and after cannot prove the tool read one
+    /// consistent version, but any change they reveal is enough to distrust the result.
+    fn changed_during(&self, read: &[PathBuf], before: &BTreeMap<PathBuf, Option<String>>, from: SystemTime) -> Vec<Value> {
+        let to = SystemTime::now();
+        read.iter()
+            .filter_map(|p| {
+                let now = hash(p);
+                match before.get(p) {
+                    Some(was) => (*was != now).then(|| json!({"path": p, "was": was, "now": now})),
+                    None => fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|t| t >= from && t <= to)
+                        .then(|| json!({"path": p, "was": null, "now": now})),
+                }
+            })
+            .collect()
+    }
+
     fn unsupported(&self, fls: &str, log: &str) -> Vec<(&'static str, String)> {
         let mut out: Vec<_> = scan::fls_paths(fls, "OUTPUT")
             .into_iter()
@@ -555,6 +582,19 @@ impl Build {
             .collect();
         out.extend(log.lines().find(|l| l.contains("runsystem(") && !l.ends_with("disabled.")).map(|l| ("shell-escape", l.to_string())));
         out
+    }
+
+    /// `\bibdata` databases BibTeX cannot find, when the sources ship a ready `.bbl` next to the
+    /// main file (arXiv bundles do). LaTeX then reads that `.bbl`; running BibTeX would only fail.
+    fn provided_bbl(&self) -> Vec<String> {
+        if !self.dir.join(format!("{}.bbl", self.job)).is_file() {
+            return Vec::new();
+        }
+        let mut lines = String::new();
+        aux_bib_lines(&self.path("aux"), &mut lines);
+        let dbs = lines.lines().filter_map(|l| l.strip_prefix("\\bibdata{")?.strip_suffix('}')).flat_map(|d| d.split(','));
+        let named = |d: &str| if Path::new(d).extension().is_some() { d.to_string() } else { format!("{d}.bib") };
+        dbs.map(|d| named(d.trim())).filter(|d| self.resolve(d).is_none()).collect()
     }
 
     fn bib_tool(&self, fls: &str) -> Option<&'static str> {
@@ -680,9 +720,25 @@ impl Build {
 
         let (mut runs, mut engine_step, mut created) = (0, 0, 0);
         let (mut fls, mut log) = (String::new(), String::new());
+        // Every input known so far: from the last converged build, the previous run's .fls, and
+        // what the bibliography tool read. Hashed right before each step to verify it afterwards.
+        let mut known: std::collections::BTreeSet<PathBuf> = state
+            .as_ref()
+            .and_then(|s| s["inputs"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i["path"].as_str().map(PathBuf::from))
+            .collect();
+        known.extend(self.engine_inputs(&read(&self.path("fls"))));
+        // Whether the latest engine run reported an error; the build is `failed` if the last one did.
+        let mut errored = false;
+        let mut used_provided_bbl = false;
+        // When the last verification of the engine's inputs began. An input modified before it was
+        // either verified unchanged by it or caused a rerun; one modified after it is unverified.
+        let mut checked_at = started;
         let (outcome, last_rerun) = loop {
             if runs == MAX_ENGINE_RUNS {
-                break ("not-converged", Some(rerun));
+                break (if errored { "failed" } else { "not-converged" }, Some(rerun));
             }
             let before: BTreeMap<_, _> = scan::fls_paths(&read(&self.path("fls")), "OUTPUT")
                 .into_iter()
@@ -698,12 +754,18 @@ impl Build {
             let _ = fs::remove_file(self.path("log"));
             let _ = fs::remove_file(self.path("fls"));
             runs += 1;
+            let known_before: BTreeMap<PathBuf, Option<String>> = known.iter().map(|p| (p.clone(), hash(p))).collect();
+            let run_started = SystemTime::now();
             let mut cmd = self.cmd(&engine);
             cmd.args(&args);
             let ran = self.start_step(&engine, cmd, rerun);
             engine_step = self.step;
             (fls, log) = (read(&self.path("fls")), read(&self.path("log")));
             let tool_missing = self.tool_missing(&engine, &ran);
+            let read_now = self.engine_inputs(&fls);
+            checked_at = SystemTime::now();
+            let mut files = self.changed_during(&read_now, &known_before, run_started);
+            known.extend(read_now);
 
             // `\include{ch/one}` stops the first run: TeX cannot create `ch/` in the output
             // directory. Recover only when the unwritable file is an include target the .aux names,
@@ -735,12 +797,43 @@ impl Build {
             if !unsupported.is_empty() {
                 break ("unsupported", None);
             }
-            if ran.code != Some(0) || has_error {
+            // An error does not stop the build when the run still left what the next steps need: the
+            // .aux it wrote (BibTeX and the next run read it) and no abort, after which TeX's files
+            // are truncated. The outcome stays `failed` while the last run errs; continuing only
+            // completes citations and references in the preview, as latexmk -f and Overleaf do.
+            errored = ran.code != Some(0) || has_error;
+            let aborted = ran.timed_out
+                || log.contains("Emergency stop")
+                || log.contains("Fatal error occurred")
+                || !scan::fls_paths(&fls, "OUTPUT").contains(&self.path("aux"));
+            if errored && aborted {
                 break ("failed", None);
             }
 
-            let mut files = self.feedback(&fls, &before);
-            if let Some(tool) = self.bib_tool(&fls) {
+            files.extend(self.feedback(&fls, &before));
+            let mut tool = self.bib_tool(&fls);
+            if tool == Some("bibtex") {
+                let unfound = self.provided_bbl();
+                if !unfound.is_empty() {
+                    tool = None;
+                    if !used_provided_bbl {
+                        used_provided_bbl = true;
+                        let bbl = self.dir.join(format!("{}.bbl", self.job));
+                        let m: Vec<scan::Missing> = unfound
+                            .into_iter()
+                            .map(|name| scan::Missing {
+                                kind: scan::Kind::File,
+                                raw: vec![format!("{name} not found; using {}", bbl.display())],
+                                name,
+                                fatal: false,
+                                substitute: Some("bbl"),
+                            })
+                            .collect();
+                        self.emit_missing(self.step, &m);
+                    }
+                }
+            }
+            if let Some(tool) = tool {
                 let now = self.bib_inputs(tool, &bib_reads);
                 let reason = if bib.is_empty() || !self.path("bbl").exists() {
                     Some(json!({"kind": "no-previous-run"}))
@@ -755,6 +848,8 @@ impl Build {
                     let bbl = self.path("bbl");
                     let bbl_was = hash(&bbl);
                     let _ = fs::remove_file(self.path("blg"));
+                    let bib_started = SystemTime::now();
+                    let bib_before: BTreeMap<PathBuf, Option<String>> = bib_reads.iter().map(|(p, _)| (p.clone(), hash(p))).collect();
                     let mut cmd = self.cmd(tool);
                     if tool == "bibtex" {
                         self.bibtex_env(&mut cmd);
@@ -775,6 +870,14 @@ impl Build {
                     self.finish_step(tool, &ran, &self.path("blg"));
                     bib_reads = reads.iter().filter_map(|r| Some((self.resolve(r)?, tool))).collect();
                     bib = self.bib_inputs(tool, &bib_reads);
+                    // A database saved while the tool ran: record no hash, so the tool runs again.
+                    let read: Vec<PathBuf> = bib_reads.iter().map(|(p, _)| p.clone()).collect();
+                    for f in self.changed_during(&read, &bib_before, bib_started) {
+                        if let Some(h) = f["path"].as_str().and_then(|k| bib.get_mut(k)) {
+                            *h = None;
+                        }
+                        files.push(f);
+                    }
                     if tool_missing || missing.iter().any(|m| m.fatal) {
                         break ("missing", None);
                     }
@@ -789,7 +892,7 @@ impl Build {
             }
             match changed(files).or_else(|| scan::rerun_request(&log).map(|m| json!({"kind": "log-requested", "message": m}))) {
                 Some(r) => rerun = r,
-                None => break ("converged", None),
+                None => break (if errored { "failed" } else { "converged" }, None),
             }
         };
 
@@ -864,11 +967,12 @@ impl Build {
         let inputs: Vec<Value> = deps.iter().map(|(p, via)| json!({"path": p, "via": via})).collect();
         self.emit("dep-info", json!({"inputs": inputs}));
 
-        // An input modified while the build ran may not be what the engine read: record no hash, so the
-        // next build reruns. mtimes past the build's end (clock skew, unpacked archives) are not edits,
-        // or such a file would never settle. ponytail: assumes sub-second mtimes (ext4, APFS, btrfs).
+        // An input modified after the last verification may not be what the engine read: record no
+        // hash, so the next build reruns. mtimes past the build's end (clock skew, unpacked archives)
+        // are not edits, or such a file would never settle. ponytail: assumes sub-second mtimes
+        // (ext4, APFS, btrfs).
         let finished = SystemTime::now();
-        let settled = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t < started || t > finished);
+        let settled = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t < checked_at || t > finished);
         let seen: Vec<(PathBuf, Option<String>)> =
             deps.iter().map(|(p, _)| (p.clone(), settled(p).then(|| hash(p)).flatten())).collect();
         if outcome == "converged" {
@@ -907,10 +1011,22 @@ fn clean(main: &Path, o: &Opts) -> bool {
         eprintln!("texweft: another build is still using these outputs; nothing removed");
         return false;
     };
+    // Only paths that stay inside the output directory: `out/../x` starts with `out` as a path
+    // prefix but names a file outside it.
+    let inside = |p: &Path| p.starts_with(&out) && !p.components().any(|c| c == std::path::Component::ParentDir);
     let mut files: std::collections::BTreeSet<PathBuf> =
-        scan::fls_paths(&read(&path("fls")), "OUTPUT").into_iter().filter(|p| p.starts_with(&out)).collect();
-    let fixed = ["fls", "log", "aux", "bbl", "blg", "bcf", "run.xml", "pdf", "xdv", "synctex.gz", "texweft.json"];
+        scan::fls_paths(&read(&path("fls")), "OUTPUT").into_iter().filter(|p| inside(p)).collect();
+    let fixed = ["fls", "log", "aux", "blg", "bcf", "run.xml", "pdf", "xdv", "synctex.gz"];
     files.extend(fixed.map(path));
+    // A .bbl may be the only copy (arXiv sources ship one without the .bib). Remove it only when
+    // the state shows texweft generated it with BibTeX or Biber.
+    let state: Option<Value> = fs::read(path("texweft.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if state.is_some_and(|s| s["bib"].as_object().is_some_and(|b| !b.is_empty())) {
+        files.insert(path("bbl"));
+    } else {
+        files.remove(&path("bbl"));
+    }
+    files.insert(path("texweft.json"));
     files.remove(main);
     let mut dirs = std::collections::BTreeSet::new();
     for f in files {
